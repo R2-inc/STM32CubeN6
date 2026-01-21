@@ -20,12 +20,21 @@
 /**************************************************************************/
 /**************************************************************************/
 
-#ifdef TX_INCLUDE_USER_DEFINE_FILE
-#include "tx_user.h"
-#endif
+    .global     _tx_thread_system_stack_ptr
+    .global     _tx_initialize_unused_memory
+    .global     __RAM_segment_used_end__
+    .global     _tx_timer_interrupt
+    .global     g_pfnVectors
+    .global     __tx_BadHandler
+    .global     __tx_IntHandler
 
-SYSTEM_CLOCK        =     6000000
-SYSTICK_CYCLES      =     ((SYSTEM_CLOCK / 100) -1)
+/* SysTick configuration for 64 MHz HSI clock, 100 Hz tick rate (10ms)
+ * Formula: SYSTICK_CYCLES = (SYSTEM_CLOCK / TX_TIMER_TICKS_PER_SECOND) - 1
+ *          SYSTICK_CYCLES = (64000000 / 100) - 1 = 639999
+ * NOTE: These values must match tx_user.h but are hardcoded here
+ *       because assembly cannot use C preprocessor defines */
+SYSTEM_CLOCK        =     64000000
+SYSTICK_CYCLES      =     639999
 
 /* Setup the stack and heap areas.  */
 
@@ -99,7 +108,7 @@ _tx_initialize_low_level:
 
     /* Setup Vector Table Offset Register.  */
     MOV     r0, #0xE000E000                         // Build address of NVIC registers
-    LDR     r1, =_vectors                           // Pickup address of vector table
+    LDR     r1, =g_pfnVectors                           // Pickup address of vector table
     STR     r1, [r0, #0xD08]                        // Set vector table address
 
     /* Enable the cycle count register.  */
@@ -110,7 +119,7 @@ _tx_initialize_low_level:
 
     /* Set system stack pointer from vector value.  */
     LDR     r0, =_tx_thread_system_stack_ptr        // Build address of system stack pointer
-    LDR     r1, =_vectors                           // Pickup address of vector table
+    LDR     r1, =g_pfnVectors                           // Pickup address of vector table
     LDR     r1, [r1]                                // Pickup reset stack pointer
     STR     r1, [r0]                                // Save system stack pointer
 
