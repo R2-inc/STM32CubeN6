@@ -28,6 +28,9 @@
 /* Include the phy driver header */
 #include "nx_stm32_phy_driver.h"
 
+/* Link-layer handler for gPTP (Layer 2 PTP) and VLAN support */
+#include "nx_link.h"
+
 #endif /* NX_STM32_ETH_DRIVER_H */
 
 /****** DRIVER SPECIFIC ****** End of part/vendor specific include file area!  */
@@ -1476,15 +1479,26 @@ static VOID  _nx_driver_deferred_processing(NX_IP_DRIVER *driver_req_ptr)
 /**************************************************************************/
 static VOID _nx_driver_transfer_to_netx(NX_IP *ip_ptr, NX_PACKET *packet_ptr, ULONG *ptp_ts_ptr)
 {
-NX_LINK_TIME link_time;
+  NX_LINK_TIME link_time;
 
-    link_time.nano_second = ptp_ts_ptr[0];
-    link_time.second_high = 0;
-    link_time.second_low = ptp_ts_ptr[1];
+  /* Set the interface for the incoming packet.  */
+  packet_ptr -> nx_packet_ip_interface = nx_driver_information.nx_driver_information_interface;
 
-    nx_link_ethernet_packet_received(ip_ptr,
-                                     nx_driver_information.nx_driver_information_interface -> nx_interface_index,
-                                     packet_ptr, &link_time);
+  /* Store PTP timestamp at the start of the packet data area.
+   * The PTP client retrieves it from here for PTP over UDP.  */
+  ((ULONG *)packet_ptr -> nx_packet_data_start)[0] = ptp_ts_ptr[0];
+  ((ULONG *)packet_ptr -> nx_packet_data_start)[1] = ptp_ts_ptr[1];
+  ((ULONG *)packet_ptr -> nx_packet_data_start)[2] = 0;
+
+  /* Build NX_LINK_TIME from hardware timestamp for link-layer processing.
+   * ptp_ts_ptr[0] = nanoseconds (TimeStampLow), ptp_ts_ptr[1] = seconds (TimeStampHigh). */
+  link_time.second_high = 0;
+  link_time.second_low  = ptp_ts_ptr[1];
+  link_time.nano_second = ptp_ts_ptr[0];
+
+  /* Route via NetX link-layer handler — handles IP, ARP, RARP, VLAN,
+   * and PTP ethertype (0x88F7) for gPTP Layer 2 transport.  */
+  nx_link_ethernet_packet_received(ip_ptr, 0, packet_ptr, &link_time);
 }
 #else
 /**************************************************************************/
@@ -1754,7 +1768,7 @@ static UINT  _nx_driver_hardware_initialize(NX_IP_DRIVER *driver_req_ptr)
   FilterConfig.HashMulticast = DISABLE;
   FilterConfig.DestAddrInverseFiltering = DISABLE;
   FilterConfig.PassAllMulticast = DISABLE;
-  FilterConfig.BroadcastFilter = ENABLE;
+  FilterConfig.BroadcastFilter = DISABLE;  /* ENABLE = set DBF bit = block broadcasts (vendor bug) */
   FilterConfig.SrcAddrInverseFiltering = DISABLE;
   FilterConfig.SrcAddrFiltering = DISABLE;
   FilterConfig.HachOrPerfectFilter = DISABLE;
@@ -1818,6 +1832,16 @@ static UINT  _nx_driver_hardware_enable(NX_IP_DRIVER *driver_req_ptr)
 
   /* Call STM32 library to start Ethernet operation.  */
   HAL_ETH_Start_IT(&eth_handle);
+
+#ifdef NX_DRIVER_ENABLE_PTP
+  /* Tell the HAL that PTP is configured so GetRxTimestamp / GetTime work.
+   * Do NOT call HAL_ETH_PTP_SetConfig() here — it fires TSINIT while the
+   * DMA is already running, which causes a MAC hang on cold boot.
+   * All PTP register setup (MACSSIR, MACTSAR, MACTSCR, TSINIT) is done
+   * in board_init.cpp BEFORE HAL_ETH_Start_IT, which is the correct order.
+   */
+  eth_handle.IsPtpConfigured = HAL_ETH_PTP_CONFIGURED;
+#endif
 
   /* Return success!  */
   return(NX_SUCCESS);
@@ -2609,12 +2633,12 @@ UINT  nx_driver_ptp_clock_callback(NX_PTP_CLIENT *client_ptr, UINT operation,
       if(time_ptr->nanosecond < 0)
       {
         time_offset.NanoSeconds = - time_ptr->nanosecond;
-        HAL_ETH_PTP_AddTimeOffset(&heth, HAL_ETH_PTP_NEGATIVE_UPDATE, &time_offset);
+        HAL_ETH_PTP_AddTimeOffset(&eth_handle, HAL_ETH_PTP_NEGATIVE_UPDATE, &time_offset);
       }
       else
       {
         time_offset.NanoSeconds = time_ptr->nanosecond;
-        HAL_ETH_PTP_AddTimeOffset(&heth, HAL_ETH_PTP_POSITIVE_UPDATE, &time_offset);
+        HAL_ETH_PTP_AddTimeOffset(&eth_handle, HAL_ETH_PTP_POSITIVE_UPDATE, &time_offset);
       }
 
       TX_RESTORE
