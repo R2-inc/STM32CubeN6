@@ -39,6 +39,17 @@
 /* Define the driver information structure that is only available within this file.  */
 static  NX_DRIVER_INFORMATION nx_driver_information;
 
+/* R2-inc fix (issue #9): the ST HAL ETH is NOT thread-safe, yet this glue driver
+   calls HAL_ETH_Transmit_IT() (send path, app/sender thread) and
+   HAL_ETH_ReleaseTxPacket() (TX-complete, NetX IP thread) concurrently. They share
+   the TX descriptor bookkeeping (TxDescList: BuffersInUse / PacketAddress /
+   CurTxDesc / releaseIndex) plus the global TxPacketCfg / eth_handle, with no
+   serialization. The unprotected read-modify-write corrupts BuffersInUse at -O3
+   (it sticks at the ring size, TX wedges permanently). This mutex serializes the
+   send against the TX-complete release. Reportable upstream to ST. */
+static TX_MUTEX nx_driver_tx_lock;
+static UINT     nx_driver_tx_lock_created = NX_FALSE;
+
 /* Rounded header size */
 static ULONG header_size;
 
@@ -426,6 +437,15 @@ static VOID  _nx_driver_initialize(NX_IP_DRIVER *driver_req_ptr)
 
   /* Clear the deferred events for the driver.  */
   nx_driver_information.nx_driver_information_deferred_events =       0;
+
+  /* R2-inc fix (issue #9): create the TX HAL serialization mutex once. */
+  if (nx_driver_tx_lock_created == NX_FALSE)
+  {
+    if (tx_mutex_create(&nx_driver_tx_lock, "ETH TX HAL lock", TX_INHERIT) == TX_SUCCESS)
+    {
+      nx_driver_tx_lock_created = NX_TRUE;
+    }
+  }
 
   /* Call the hardware-specific ethernet controller initialization.  */
   status =  _nx_driver_hardware_initialize(driver_req_ptr);
@@ -1374,6 +1394,8 @@ static VOID  _nx_driver_deferred_processing(NX_IP_DRIVER *driver_req_ptr)
 #ifdef MULTI_QUEUE_FEATURE
     if(deferred_events & NX_DRIVER_DEFERRED_PACKET_TRANSMITTED_CH0)
     {
+      /* R2-inc fix (issue #9): serialize TX-complete release against the send. */
+      if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_get(&nx_driver_tx_lock, TX_WAIT_FOREVER); }
       eth_handle.TxOpCH = ETH_DMA_CH0_IDX;
       buff_in_use = HAL_ETH_GetTxBuffersNumber(&eth_handle);
 
@@ -1383,10 +1405,13 @@ static VOID  _nx_driver_deferred_processing(NX_IP_DRIVER *driver_req_ptr)
         nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[ETH_DMA_CH0_IDX] = buff_in_use;
 
       }
+      if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_put(&nx_driver_tx_lock); }
     }
 
     if(deferred_events & NX_DRIVER_DEFERRED_PACKET_TRANSMITTED_CH1)
     {
+      /* R2-inc fix (issue #9): serialize TX-complete release against the send. */
+      if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_get(&nx_driver_tx_lock, TX_WAIT_FOREVER); }
       eth_handle.TxOpCH = ETH_DMA_CH1_IDX;
       buff_in_use = HAL_ETH_GetTxBuffersNumber(&eth_handle);
 
@@ -1395,6 +1420,7 @@ static VOID  _nx_driver_deferred_processing(NX_IP_DRIVER *driver_req_ptr)
         HAL_ETH_ReleaseTxPacket(&eth_handle);
         nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[ETH_DMA_CH1_IDX] = buff_in_use;
     }
+      if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_put(&nx_driver_tx_lock); }
   }
 
   if(deferred_events & NX_DRIVER_DEFERRED_PACKET_RECEIVED_CH0)
@@ -1954,7 +1980,12 @@ NX_INTERFACE *interface_ptr;
 
     status = nx_shaper_hw_queue_id_get(interface_ptr,packet_ptr,&channel_number);
 
+    /* R2-inc fix (issue #9): serialize the send (TxPacketCfg/Txbuffer/descriptor
+       build + HAL_ETH_Transmit_IT) against the TX-complete release and other
+       senders -- the HAL is not thread-safe. */
+    if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_get(&nx_driver_tx_lock, TX_WAIT_FOREVER); }
     status =  _nx_driver_hardware_packet_send_distribute(packet_ptr, channel_number);
+    if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_put(&nx_driver_tx_lock); }
 
  return status;
 
