@@ -50,6 +50,34 @@ static  NX_DRIVER_INFORMATION nx_driver_information;
 static TX_MUTEX nx_driver_tx_lock;
 static UINT     nx_driver_tx_lock_created = NX_FALSE;
 
+/* R2-inc (issue #9): TX-reclaim instrumentation. Proves whether the reclaim-on-send
+   backstop is doing work the TX-complete deferred-event path failed to do -- i.e.
+   that the lost-wakeup pathology is real and that the backstop prevents the wedge.
+   All counters are cheap (a few ULONG ops per packet) and read via the getters
+   below. r2_tx_backstop_saves is the headline proof: each one is a moment the TX
+   ring was FULL of completed-but-unreclaimed descriptors that the send-path sweep
+   had to force-free -- pre-fix every one of those was a permanent TX wedge. */
+static volatile ULONG r2_tx_send_count     = 0;  /* sends that ran the reclaim-on-send sweep */
+static volatile ULONG r2_tx_onsend_freed   = 0;  /* descriptors freed by the reclaim-on-send sweep */
+static volatile ULONG r2_tx_deferred_freed = 0;  /* descriptors freed by the deferred-event path */
+static volatile ULONG r2_tx_max_inuse      = 0;  /* high-water buffers-in-use at send entry */
+static volatile ULONG r2_tx_full_at_send   = 0;  /* sends entering with the ring FULL (== ETH_TX_DESC_CNT) */
+static volatile ULONG r2_tx_backstop_saves = 0;  /* ring was full AND the sweep force-freed >0 = wedge prevented */
+
+ULONG r2_eth_tx_stat_send_count(void);
+ULONG r2_eth_tx_stat_onsend_freed(void);
+ULONG r2_eth_tx_stat_deferred_freed(void);
+ULONG r2_eth_tx_stat_max_inuse(void);
+ULONG r2_eth_tx_stat_full_at_send(void);
+ULONG r2_eth_tx_stat_backstop_saves(void);
+
+ULONG r2_eth_tx_stat_send_count(void)     { return r2_tx_send_count; }
+ULONG r2_eth_tx_stat_onsend_freed(void)   { return r2_tx_onsend_freed; }
+ULONG r2_eth_tx_stat_deferred_freed(void) { return r2_tx_deferred_freed; }
+ULONG r2_eth_tx_stat_max_inuse(void)      { return r2_tx_max_inuse; }
+ULONG r2_eth_tx_stat_full_at_send(void)   { return r2_tx_full_at_send; }
+ULONG r2_eth_tx_stat_backstop_saves(void) { return r2_tx_backstop_saves; }
+
 /* Rounded header size */
 static ULONG header_size;
 
@@ -1404,9 +1432,11 @@ static VOID  _nx_driver_deferred_processing(NX_IP_DRIVER *driver_req_ptr)
 
       if (buff_in_use >= NX_DRIVER_TX_RELEASE_THRESHOLD)
       {
+        ULONG after;
         HAL_ETH_ReleaseTxPacket(&eth_handle);
         nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[ETH_DMA_CH0_IDX] = buff_in_use;
-
+        after = HAL_ETH_GetTxBuffersNumber(&eth_handle);     /* R2-inc (#9): count what the deferred path reclaimed */
+        if (buff_in_use > after) { r2_tx_deferred_freed += (buff_in_use - after); }
       }
       if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_put(&nx_driver_tx_lock); }
     }
@@ -1420,8 +1450,11 @@ static VOID  _nx_driver_deferred_processing(NX_IP_DRIVER *driver_req_ptr)
 
       if (buff_in_use >= NX_DRIVER_TX_RELEASE_THRESHOLD)
       {
+        ULONG after;
         HAL_ETH_ReleaseTxPacket(&eth_handle);
         nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[ETH_DMA_CH1_IDX] = buff_in_use;
+        after = HAL_ETH_GetTxBuffersNumber(&eth_handle);     /* R2-inc (#9): count what the deferred path reclaimed */
+        if (buff_in_use > after) { r2_tx_deferred_freed += (buff_in_use - after); }
     }
       if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_put(&nx_driver_tx_lock); }
   }
@@ -1996,11 +2029,25 @@ NX_INTERFACE *interface_ptr;
        not depend on the ISR->thread event handshake. HAL_ETH_ReleaseTxPacket only
        frees OWN=0 (transmitted) descriptors and is idempotent under this same mutex. */
     eth_handle.TxOpCH = channel_number;
-    if (HAL_ETH_GetTxBuffersNumber(&eth_handle) > 0U)
     {
-      HAL_ETH_ReleaseTxPacket(&eth_handle);
-      nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[channel_number] =
-        HAL_ETH_GetTxBuffersNumber(&eth_handle);
+      ULONG b0 = HAL_ETH_GetTxBuffersNumber(&eth_handle);
+      r2_tx_send_count++;
+      if (b0 > r2_tx_max_inuse)        { r2_tx_max_inuse = b0; }
+      if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_full_at_send++; }
+      if (b0 > 0U)
+      {
+        ULONG b1;
+        HAL_ETH_ReleaseTxPacket(&eth_handle);
+        b1 = HAL_ETH_GetTxBuffersNumber(&eth_handle);
+        nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[channel_number] = b1;
+        if (b1 < b0)
+        {
+          r2_tx_onsend_freed += (b0 - b1);
+          /* Ring was completely full of completed-but-unreclaimed descriptors and
+             the sweep had to free them: pre-fix this was a permanent wedge. */
+          if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_backstop_saves++; }
+        }
+      }
     }
 
     status =  _nx_driver_hardware_packet_send_distribute(packet_ptr, channel_number);
