@@ -60,21 +60,27 @@ static UINT     nx_driver_tx_lock_created = NX_FALSE;
 static volatile ULONG r2_tx_send_count     = 0;  /* sends that ran the reclaim-on-send sweep */
 static volatile ULONG r2_tx_onsend_freed   = 0;  /* descriptors freed by the reclaim-on-send sweep */
 static volatile ULONG r2_tx_deferred_freed = 0;  /* descriptors freed by the deferred-event path */
-static volatile ULONG r2_tx_max_inuse      = 0;  /* high-water buffers-in-use at send entry */
+static volatile ULONG r2_tx_max_inuse      = 0;  /* interval high-water buffers-in-use (cleared by _take) */
+static volatile ULONG r2_tx_max_inuse_hwm  = 0;  /* all-time high-water buffers-in-use (never cleared) */
 static volatile ULONG r2_tx_full_at_send   = 0;  /* sends entering with the ring FULL (== ETH_TX_DESC_CNT) */
 static volatile ULONG r2_tx_backstop_saves = 0;  /* ring was full AND the sweep force-freed >0 = wedge prevented */
 
 ULONG r2_eth_tx_stat_send_count(void);
 ULONG r2_eth_tx_stat_onsend_freed(void);
 ULONG r2_eth_tx_stat_deferred_freed(void);
-ULONG r2_eth_tx_stat_max_inuse(void);
+ULONG r2_eth_tx_stat_max_inuse_take(void);
+ULONG r2_eth_tx_stat_max_inuse_hwm(void);
 ULONG r2_eth_tx_stat_full_at_send(void);
 ULONG r2_eth_tx_stat_backstop_saves(void);
 
 ULONG r2_eth_tx_stat_send_count(void)     { return r2_tx_send_count; }
 ULONG r2_eth_tx_stat_onsend_freed(void)   { return r2_tx_onsend_freed; }
 ULONG r2_eth_tx_stat_deferred_freed(void) { return r2_tx_deferred_freed; }
-ULONG r2_eth_tx_stat_max_inuse(void)      { return r2_tx_max_inuse; }
+/* Read-and-clear the interval peak. One designated consumer (the ETH tag publish)
+   should call this per publish cycle; a peak landing exactly between the read and
+   the clear may be missed (benign for telemetry). */
+ULONG r2_eth_tx_stat_max_inuse_take(void) { ULONG v = r2_tx_max_inuse; r2_tx_max_inuse = 0; return v; }
+ULONG r2_eth_tx_stat_max_inuse_hwm(void)  { return r2_tx_max_inuse_hwm; }
 ULONG r2_eth_tx_stat_full_at_send(void)   { return r2_tx_full_at_send; }
 ULONG r2_eth_tx_stat_backstop_saves(void) { return r2_tx_backstop_saves; }
 
@@ -2032,7 +2038,8 @@ NX_INTERFACE *interface_ptr;
     {
       ULONG b0 = HAL_ETH_GetTxBuffersNumber(&eth_handle);
       r2_tx_send_count++;
-      if (b0 > r2_tx_max_inuse)        { r2_tx_max_inuse = b0; }
+      if (b0 > r2_tx_max_inuse)         { r2_tx_max_inuse = b0; }      /* interval peak (cleared on publish) */
+      if (b0 > r2_tx_max_inuse_hwm)     { r2_tx_max_inuse_hwm = b0; }  /* all-time peak */
       if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_full_at_send++; }
       if (b0 > 0U)
       {
