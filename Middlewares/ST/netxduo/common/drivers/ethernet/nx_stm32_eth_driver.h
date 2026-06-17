@@ -216,8 +216,13 @@ typedef struct NX_DRIVER_INFORMATION_STRUCT
     NX_INTERFACE        *nx_driver_information_interface;
 
     /* Define the deferred event field. This will contain bits representing events
-       deferred from the ISR for processing in the thread context.  */
-    ULONG               nx_driver_information_deferred_events;
+       deferred from the ISR for processing in the thread context.
+       R2-inc fix (issue #9): volatile -- this flag is RMW'd in the ETH ISR
+       (HAL_ETH_TxCpltCallback |=) and read/cleared in the IP thread under
+       TX_DISABLE/TX_RESTORE. On the Cortex-M55 BASEPRI port those macros are NOT
+       compiler barriers, so without volatile -O3 may cache/reorder the access and
+       drop a TX-complete wakeup -> descriptors never reclaimed -> TX wedge. */
+    volatile ULONG      nx_driver_information_deferred_events;
 
 
     /****** DRIVER SPECIFIC ****** Start of part/vendor specific driver information area.  Include any such constants here!  */

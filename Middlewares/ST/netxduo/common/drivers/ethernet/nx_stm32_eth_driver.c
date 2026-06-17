@@ -1383,11 +1383,14 @@ static VOID  _nx_driver_deferred_processing(NX_IP_DRIVER *driver_req_ptr)
 #endif
   /* Disable interrupts.  */
   TX_DISABLE
+  __DMB();   /* R2-inc fix (issue #9): order the read/clear vs the ISR |= -- the M55
+                BASEPRI TX_DISABLE is not a memory barrier. */
 
   /* Pickup deferred events.  */
   deferred_events =  nx_driver_information.nx_driver_information_deferred_events;
   nx_driver_information.nx_driver_information_deferred_events =  0;
 
+  __DMB();
   /* Restore interrupts.  */
   TX_RESTORE
 
@@ -1984,6 +1987,22 @@ NX_INTERFACE *interface_ptr;
        build + HAL_ETH_Transmit_IT) against the TX-complete release and other
        senders -- the HAL is not thread-safe. */
     if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_get(&nx_driver_tx_lock, TX_WAIT_FOREVER); }
+
+    /* R2-inc fix (issue #9 residual): reclaim-on-send. TX descriptors are otherwise
+       reclaimed ONLY by the TX-complete deferred event (_nx_driver_deferred_processing).
+       If a single such wakeup is ever lost, completed descriptors accumulate with no
+       backstop until the ring wedges permanently (board reset required). Sweep any
+       transmitted descriptors here on every send so reclaim is self-healing and does
+       not depend on the ISR->thread event handshake. HAL_ETH_ReleaseTxPacket only
+       frees OWN=0 (transmitted) descriptors and is idempotent under this same mutex. */
+    eth_handle.TxOpCH = channel_number;
+    if (HAL_ETH_GetTxBuffersNumber(&eth_handle) > 0U)
+    {
+      HAL_ETH_ReleaseTxPacket(&eth_handle);
+      nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[channel_number] =
+        HAL_ETH_GetTxBuffersNumber(&eth_handle);
+    }
+
     status =  _nx_driver_hardware_packet_send_distribute(packet_ptr, channel_number);
     if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_put(&nx_driver_tx_lock); }
 
