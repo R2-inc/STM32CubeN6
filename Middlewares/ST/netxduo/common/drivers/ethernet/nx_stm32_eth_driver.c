@@ -64,6 +64,9 @@ static volatile ULONG r2_tx_max_inuse      = 0;  /* interval high-water buffers-
 static volatile ULONG r2_tx_max_inuse_hwm  = 0;  /* all-time high-water buffers-in-use (never cleared) */
 static volatile ULONG r2_tx_full_at_send   = 0;  /* sends entering with the ring FULL (== ETH_TX_DESC_CNT) */
 static volatile ULONG r2_tx_backstop_saves = 0;  /* ring was full AND the sweep force-freed >0 = wedge prevented */
+static volatile ULONG r2_tx_hal_fail       = 0;  /* HAL_ETH_Transmit_IT returned != HAL_OK -> packet DROPPED in the
+                                                    driver even though NetX source_send already counted it as sent.
+                                                    ~= the silent counted-but-not-transmitted loss. */
 
 ULONG r2_eth_tx_stat_send_count(void);
 ULONG r2_eth_tx_stat_onsend_freed(void);
@@ -72,6 +75,7 @@ ULONG r2_eth_tx_stat_max_inuse_take(void);
 ULONG r2_eth_tx_stat_max_inuse_hwm(void);
 ULONG r2_eth_tx_stat_full_at_send(void);
 ULONG r2_eth_tx_stat_backstop_saves(void);
+ULONG r2_eth_tx_stat_hal_fail(void);
 
 ULONG r2_eth_tx_stat_send_count(void)     { return r2_tx_send_count; }
 ULONG r2_eth_tx_stat_onsend_freed(void)   { return r2_tx_onsend_freed; }
@@ -83,6 +87,7 @@ ULONG r2_eth_tx_stat_max_inuse_take(void) { ULONG v = r2_tx_max_inuse; r2_tx_max
 ULONG r2_eth_tx_stat_max_inuse_hwm(void)  { return r2_tx_max_inuse_hwm; }
 ULONG r2_eth_tx_stat_full_at_send(void)   { return r2_tx_full_at_send; }
 ULONG r2_eth_tx_stat_backstop_saves(void) { return r2_tx_backstop_saves; }
+ULONG r2_eth_tx_stat_hal_fail(void)       { return r2_tx_hal_fail; }
 
 /* Rounded header size */
 static ULONG header_size;
@@ -2132,7 +2137,10 @@ static UINT  _nx_driver_hardware_packet_send_distribute(NX_PACKET *packet_ptr, U
   TxPacketCfg.pData = (uint32_t *)packet_ptr;
 
   if(HAL_ETH_Transmit_IT(&eth_handle, &TxPacketCfg) != HAL_OK)
+  {
+    r2_tx_hal_fail++;  /* counted by NetX as sent, but dropped here -> never on the wire */
     return NX_DRIVER_ERROR;
+  }
 
   return  NX_SUCCESS;
 }
