@@ -472,7 +472,14 @@ static VOID  _nx_driver_initialize(NX_IP_DRIVER *driver_req_ptr)
   /* Clear the deferred events for the driver.  */
   nx_driver_information.nx_driver_information_deferred_events =       0;
 
-  /* R2-inc fix (issue #9): create the TX HAL serialization mutex once. */
+  /* R2-inc fix (issue #9): create the TX HAL serialization mutex once. Serializes the
+     send path (TxPacketCfg/descriptor build + HAL_ETH_Transmit_IT) against the
+     TX-complete release (NetX IP thread) and other senders (HTTP, PTP, ARP), because
+     the ST HAL TX path is not reentrant. Kept intentionally: an A/B soak with it
+     disabled (200s @ 8kSPS) came up clean (maxIU 6/8, full=0, halFail=0, SeqDrop=0),
+     but a clean run cannot prove the absence of a rare send-vs-release race, and the
+     guard is cheap (priority-inherit). Removing it would trade a defensible
+     safety-case line for an unprovable corruption risk. */
   if (nx_driver_tx_lock_created == NX_FALSE)
   {
     if (tx_mutex_create(&nx_driver_tx_lock, "ETH TX HAL lock", TX_INHERIT) == TX_SUCCESS)
