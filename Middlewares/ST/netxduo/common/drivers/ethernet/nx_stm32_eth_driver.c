@@ -50,35 +50,31 @@ static  NX_DRIVER_INFORMATION nx_driver_information;
 static TX_MUTEX nx_driver_tx_lock;
 static UINT     nx_driver_tx_lock_created = NX_FALSE;
 
-/* R2-inc (issue #9): TX-reclaim instrumentation. Proves whether the reclaim-on-send
-   backstop is doing work the TX-complete deferred-event path failed to do -- i.e.
-   that the lost-wakeup pathology is real and that the backstop prevents the wedge.
-   All counters are cheap (a few ULONG ops per packet) and read via the getters
-   below. r2_tx_backstop_saves is the headline proof: each one is a moment the TX
-   ring was FULL of completed-but-unreclaimed descriptors that the send-path sweep
-   had to force-free -- pre-fix every one of those was a permanent TX wedge. */
-static volatile ULONG r2_tx_send_count     = 0;  /* sends that ran the reclaim-on-send sweep */
-static volatile ULONG r2_tx_onsend_freed   = 0;  /* descriptors freed by the reclaim-on-send sweep */
+/* R2-inc (issue #9): TX health instrumentation. Cheap (a few ULONG ops per packet),
+   read via the getters below. After the MPU cache fix removed the TX wedge, these
+   track ongoing TX-ring health: peak ring depth (max_inuse), any full-ring event
+   (full_at_send, must stay 0), descriptors reclaimed by the deferred path
+   (deferred_freed), and any HAL_ETH_Transmit_IT failure (hal_fail = silent
+   counted-but-not-transmitted loss). The reclaim-on-send sweep that the
+   onsend_freed/backstop_saves counters once measured was removed once an A/B soak
+   proved the deferred path reclaims 100% on its own. */
+static volatile ULONG r2_tx_send_count     = 0;  /* total sends through the driver */
 static volatile ULONG r2_tx_deferred_freed = 0;  /* descriptors freed by the deferred-event path */
 static volatile ULONG r2_tx_max_inuse      = 0;  /* interval high-water buffers-in-use (cleared by _take) */
 static volatile ULONG r2_tx_max_inuse_hwm  = 0;  /* all-time high-water buffers-in-use (never cleared) */
 static volatile ULONG r2_tx_full_at_send   = 0;  /* sends entering with the ring FULL (== ETH_TX_DESC_CNT) */
-static volatile ULONG r2_tx_backstop_saves = 0;  /* ring was full AND the sweep force-freed >0 = wedge prevented */
 static volatile ULONG r2_tx_hal_fail       = 0;  /* HAL_ETH_Transmit_IT returned != HAL_OK -> packet DROPPED in the
                                                     driver even though NetX source_send already counted it as sent.
                                                     ~= the silent counted-but-not-transmitted loss. */
 
 ULONG r2_eth_tx_stat_send_count(void);
-ULONG r2_eth_tx_stat_onsend_freed(void);
 ULONG r2_eth_tx_stat_deferred_freed(void);
 ULONG r2_eth_tx_stat_max_inuse_take(void);
 ULONG r2_eth_tx_stat_max_inuse_hwm(void);
 ULONG r2_eth_tx_stat_full_at_send(void);
-ULONG r2_eth_tx_stat_backstop_saves(void);
 ULONG r2_eth_tx_stat_hal_fail(void);
 
 ULONG r2_eth_tx_stat_send_count(void)     { return r2_tx_send_count; }
-ULONG r2_eth_tx_stat_onsend_freed(void)   { return r2_tx_onsend_freed; }
 ULONG r2_eth_tx_stat_deferred_freed(void) { return r2_tx_deferred_freed; }
 /* Read-and-clear the interval peak. One designated consumer (the ETH tag publish)
    should call this per publish cycle; a peak landing exactly between the read and
@@ -86,7 +82,6 @@ ULONG r2_eth_tx_stat_deferred_freed(void) { return r2_tx_deferred_freed; }
 ULONG r2_eth_tx_stat_max_inuse_take(void) { ULONG v = r2_tx_max_inuse; r2_tx_max_inuse = 0; return v; }
 ULONG r2_eth_tx_stat_max_inuse_hwm(void)  { return r2_tx_max_inuse_hwm; }
 ULONG r2_eth_tx_stat_full_at_send(void)   { return r2_tx_full_at_send; }
-ULONG r2_eth_tx_stat_backstop_saves(void) { return r2_tx_backstop_saves; }
 ULONG r2_eth_tx_stat_hal_fail(void)       { return r2_tx_hal_fail; }
 
 /* Rounded header size */
@@ -2032,24 +2027,18 @@ NX_INTERFACE *interface_ptr;
        senders -- the HAL is not thread-safe. */
     if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_get(&nx_driver_tx_lock, TX_WAIT_FOREVER); }
 
-    /* R2-inc (issue #9): reclaim-on-send sweep.
+    /* R2-inc (issue #9): TX ring depth instrumentation.
 
-       HISTORY: added when the TX ring was wedging under load and reclaim seemed to
-       depend on a fragile ISR->thread deferred-event handshake. The ROOT CAUSE was
-       later found to be a cache-coherency bug -- TX DMA descriptors sat in cacheable
-       RAM (undersized MPU non-cacheable region), so DMA read a stale OWN bit and
-       parked (TBU). With the MPU fix (whole DMARAM non-cacheable) the stock deferred
-       path (HAL_ETH_ReleaseTxPacket in _nx_driver_hardware_transmit/deferred proc)
-       drains the ring reliably and this on-send sweep is believed to be dead weight.
-
-       R2_TX_RECLAIM_ON_SEND gates the sweep so it can be A/B'd toward a minimal,
-       SIL-defensible TX driver. Set 0 to disable (deferred path only) and soak;
-       if r2_tx_max_inuse_hwm stays well below ETH_TX_DESC_CNT and halFail==0 the
-       sweep is confirmed unnecessary and can be deleted outright. The depth
-       instrumentation below stays live in BOTH modes so the soak yields evidence. */
-#ifndef R2_TX_RECLAIM_ON_SEND
-#define R2_TX_RECLAIM_ON_SEND 1   /* 1 = legacy sweep (current); 0 = deferred path only (strip test) */
-#endif
+       An on-send reclaim sweep used to live here as a wedge backstop. The ROOT CAUSE
+       of the wedge was later found to be a cache-coherency bug -- TX DMA descriptors
+       sat in cacheable RAM (undersized MPU non-cacheable region), so DMA read a stale
+       OWN bit and parked (TBU). Once the MPU config was fixed (whole DMARAM
+       non-cacheable), the stock TX-complete deferred path (HAL_ETH_ReleaseTxPacket in
+       the deferred processing) reclaims the ring reliably on its own. An A/B soak
+       (200s @ 8kSPS unbatched) confirmed it: deferred path reclaimed 100%, ring
+       peaked 5/8, full=0, halFail=0, SeqDrop=0 -- the sweep was dead weight and was
+       removed. These counters stay as cheap live health telemetry (peak ring depth
+       and any full-ring event, which should never occur). */
     eth_handle.TxOpCH = channel_number;
     {
       ULONG b0 = HAL_ETH_GetTxBuffersNumber(&eth_handle);
@@ -2057,22 +2046,6 @@ NX_INTERFACE *interface_ptr;
       if (b0 > r2_tx_max_inuse)         { r2_tx_max_inuse = b0; }      /* interval peak (cleared on publish) */
       if (b0 > r2_tx_max_inuse_hwm)     { r2_tx_max_inuse_hwm = b0; }  /* all-time peak */
       if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_full_at_send++; }
-#if R2_TX_RECLAIM_ON_SEND
-      if (b0 > 0U)
-      {
-        ULONG b1;
-        HAL_ETH_ReleaseTxPacket(&eth_handle);
-        b1 = HAL_ETH_GetTxBuffersNumber(&eth_handle);
-        nx_driver_information.nx_driver_information_number_of_transmit_buffers_in_use[channel_number] = b1;
-        if (b1 < b0)
-        {
-          r2_tx_onsend_freed += (b0 - b1);
-          /* Ring was completely full of completed-but-unreclaimed descriptors and
-             the sweep had to free them: pre-fix this was a permanent wedge. */
-          if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_backstop_saves++; }
-        }
-      }
-#endif /* R2_TX_RECLAIM_ON_SEND */
     }
 
     status =  _nx_driver_hardware_packet_send_distribute(packet_ptr, channel_number);
