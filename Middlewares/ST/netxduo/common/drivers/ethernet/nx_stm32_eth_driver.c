@@ -2059,6 +2059,19 @@ NX_INTERFACE *interface_ptr;
              the sweep had to free them: pre-fix this was a permanent wedge. */
           if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_backstop_saves++; }
         }
+        if (b1 > 0U)
+        {
+          /* R2-inc fix (8kSPS capture loss): descriptors are still in flight. The HAL
+             issues a TX poll-demand ONLY on a successful Transmit_IT; when the ring is
+             full and Transmit_IT fails, the suspended TX DMA (DMACSR.TBU) is never
+             re-armed and only drains on the next ~10ms reclaim cycle -> it transmits in
+             ~12-frame bursts and ~90% of frames are dropped (counted as sent). Re-arm
+             the DMA tail pointer here so a suspended DMA resumes draining immediately,
+             every send -- the poll-demand is a no-op when the DMA is already running. */
+          __DSB();
+          WRITE_REG(eth_handle.Instance->DMA_CH[channel_number].DMACTXDTPR,
+                    (uint32_t)(eth_handle.TxDescList[channel_number].TxDesc[eth_handle.TxDescList[channel_number].CurTxDesc]));
+        }
       }
     }
 
