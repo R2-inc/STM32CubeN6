@@ -2032,13 +2032,24 @@ NX_INTERFACE *interface_ptr;
        senders -- the HAL is not thread-safe. */
     if (nx_driver_tx_lock_created != NX_FALSE) { tx_mutex_get(&nx_driver_tx_lock, TX_WAIT_FOREVER); }
 
-    /* R2-inc fix (issue #9 residual): reclaim-on-send. TX descriptors are otherwise
-       reclaimed ONLY by the TX-complete deferred event (_nx_driver_deferred_processing).
-       If a single such wakeup is ever lost, completed descriptors accumulate with no
-       backstop until the ring wedges permanently (board reset required). Sweep any
-       transmitted descriptors here on every send so reclaim is self-healing and does
-       not depend on the ISR->thread event handshake. HAL_ETH_ReleaseTxPacket only
-       frees OWN=0 (transmitted) descriptors and is idempotent under this same mutex. */
+    /* R2-inc (issue #9): reclaim-on-send sweep.
+
+       HISTORY: added when the TX ring was wedging under load and reclaim seemed to
+       depend on a fragile ISR->thread deferred-event handshake. The ROOT CAUSE was
+       later found to be a cache-coherency bug -- TX DMA descriptors sat in cacheable
+       RAM (undersized MPU non-cacheable region), so DMA read a stale OWN bit and
+       parked (TBU). With the MPU fix (whole DMARAM non-cacheable) the stock deferred
+       path (HAL_ETH_ReleaseTxPacket in _nx_driver_hardware_transmit/deferred proc)
+       drains the ring reliably and this on-send sweep is believed to be dead weight.
+
+       R2_TX_RECLAIM_ON_SEND gates the sweep so it can be A/B'd toward a minimal,
+       SIL-defensible TX driver. Set 0 to disable (deferred path only) and soak;
+       if r2_tx_max_inuse_hwm stays well below ETH_TX_DESC_CNT and halFail==0 the
+       sweep is confirmed unnecessary and can be deleted outright. The depth
+       instrumentation below stays live in BOTH modes so the soak yields evidence. */
+#ifndef R2_TX_RECLAIM_ON_SEND
+#define R2_TX_RECLAIM_ON_SEND 1   /* 1 = legacy sweep (current); 0 = deferred path only (strip test) */
+#endif
     eth_handle.TxOpCH = channel_number;
     {
       ULONG b0 = HAL_ETH_GetTxBuffersNumber(&eth_handle);
@@ -2046,6 +2057,7 @@ NX_INTERFACE *interface_ptr;
       if (b0 > r2_tx_max_inuse)         { r2_tx_max_inuse = b0; }      /* interval peak (cleared on publish) */
       if (b0 > r2_tx_max_inuse_hwm)     { r2_tx_max_inuse_hwm = b0; }  /* all-time peak */
       if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_full_at_send++; }
+#if R2_TX_RECLAIM_ON_SEND
       if (b0 > 0U)
       {
         ULONG b1;
@@ -2060,6 +2072,7 @@ NX_INTERFACE *interface_ptr;
           if (b0 == (ULONG)ETH_TX_DESC_CNT) { r2_tx_backstop_saves++; }
         }
       }
+#endif /* R2_TX_RECLAIM_ON_SEND */
     }
 
     status =  _nx_driver_hardware_packet_send_distribute(packet_ptr, channel_number);
